@@ -54,6 +54,7 @@ extern crate alloc;
 
 pub use mp3lame_sys as ffi;
 
+use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::{self, MaybeUninit};
 use core::ptr::{self, NonNull};
@@ -64,6 +65,7 @@ pub use input::*;
 
 ///Maximum size of album art
 pub const MAX_ALBUM_ART_SIZE: usize = 128 * 1024;
+const MAX_BUFFER: usize = 250;
 
 ///Calculates maximum required size for specified number of samples.
 ///
@@ -302,6 +304,52 @@ pub enum Quality {
     Worst = 9,
 }
 
+/// Enum wrapper for ID3 Value
+pub enum Id3Value<'a> {
+    ///The title
+    Title(&'a [u8]),
+    ///The artist
+    Artist(&'a [u8]),
+    ///Track number
+    Track(&'a [u8]),
+    ///Album title
+    Album(&'a [u8]),
+    ///Album art image
+    AlbumArt(&'a [u8]),
+    ///The year
+    Year(&'a [u8]),
+    ///The genre
+    Genre(&'a [u8]),
+    ///Comment
+    Comment(&'a [u8]),
+}
+
+impl Id3Value<'_> {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Title(val)
+                | Self::Artist(val)
+                | Self::Track(val)
+                | Self::Album(val)
+                | Self::AlbumArt(val)
+                | Self::Year(val)
+                | Self::Genre(val)
+                | Self::Comment(val) => &val,
+        }
+    }
+
+    fn as_buffer_pointer(&self) -> [u8; MAX_BUFFER + 1] { //[u8; MAX_BUFFER + 1]{
+        let v = self.as_bytes();
+        let mut buffer = [0u8; MAX_BUFFER + 1];
+        let size = cmp::min(MAX_BUFFER, v.len());
+        unsafe {
+            ptr::copy_nonoverlapping(v.as_ptr(), buffer.as_mut_ptr(), size.clone());
+        }
+        buffer[size] = 0;
+        buffer
+    }
+}
+
 ///ID3 tag as raw bytes.
 ///
 ///Use empty slice for `None`
@@ -312,6 +360,8 @@ pub struct Id3Tag<'a> {
     pub title: &'a [u8],
     ///Artist name
     pub artist: &'a [u8],
+    ///Track number
+    pub track: &'a [u8],
     ///Album name
     pub album: &'a [u8],
     ///Album art
@@ -325,16 +375,35 @@ pub struct Id3Tag<'a> {
     pub album_art: &'a [u8],
     ///Year
     pub year: &'a [u8],
+    ///Genre
+    pub genre: &'a [u8],
     ///Comment
     pub comment: &'a [u8],
 }
 
-impl Id3Tag<'_> {
+impl<'a> Into<Vec<Id3Value<'a>>> for Id3Tag<'a> {
+    fn into(self) -> Vec<Id3Value<'a>> {
+        use Id3Value::*;
+        vec![
+            Title(self.title),
+            Artist(self.artist),
+            Track(self.track),
+            Album(self.album),
+            AlbumArt(self.album_art),
+            Year(self.year),
+            Genre(self.genre),
+            Comment(self.comment),
+        ]
+    }
+}
+
+impl<'a> Id3Tag<'a> {
     #[inline(always)]
     ///Returns true if any is set
     pub const fn is_any_set(&self) -> bool {
         !self.title.is_empty() || !self.artist.is_empty() || !self.album.is_empty() || !self.album_art.is_empty() || !self.year.is_empty() || !self.comment.is_empty()
     }
+
 }
 
 ///Builder of C LAME encoder.
@@ -488,60 +557,34 @@ impl Builder {
     ///But `v2` is always added at the beginning.
     ///
     ///Returns whether it is supported or not.
-    pub fn set_id3_tag(&mut self, value: Id3Tag<'_>) -> Result<(), Id3TagError> {
-        if !value.is_any_set() {
-            return Ok(());
+    pub fn set_id3_tag<'a>(&mut self, value: impl Into<Vec<Id3Value<'a>>>) -> Result<(), Id3TagError> {
+        for id3_value in value.into() {
+            self.set_id3_inner(id3_value)?;
         }
+        Ok(())
+    }
 
-        const MAX_BUFFER: usize = 250;
-        let mut buffer = [0u8; MAX_BUFFER + 1];
-
-        unsafe {
-            ffi::id3tag_init(self.ptr());
-            ffi::id3tag_add_v2(self.ptr());
-
-            if !value.album_art.is_empty() {
-                let size = value.album_art.len();
-                if size > MAX_ALBUM_ART_SIZE {
-                    return Err(Id3TagError::AlbumArtOverflow);
-                }
-                let ptr = value.album_art.as_ptr();
-                ffi::id3tag_set_albumart(self.ptr(), ptr as _, size);
-            }
-
-            if !value.title.is_empty() {
-                let size = cmp::min(MAX_BUFFER, value.title.len());
-                ptr::copy_nonoverlapping(value.title.as_ptr(), buffer.as_mut_ptr(), size);
-                buffer[size] = 0;
-                ffi::id3tag_set_title(self.ptr(), buffer.as_ptr() as _);
-            }
-
-            if !value.album.is_empty() {
-                let size = cmp::min(MAX_BUFFER, value.album.len());
-                ptr::copy_nonoverlapping(value.album.as_ptr(), buffer.as_mut_ptr(), size);
-                buffer[size] = 0;
-                ffi::id3tag_set_album(self.ptr(), buffer.as_ptr() as _);
-            }
-
-            if !value.artist.is_empty() {
-                let size = cmp::min(MAX_BUFFER, value.artist.len());
-                ptr::copy_nonoverlapping(value.artist.as_ptr(), buffer.as_mut_ptr(), size);
-                buffer[size] = 0;
-                ffi::id3tag_set_artist(self.ptr(), buffer.as_ptr() as _);
-            }
-
-            if !value.year.is_empty() {
-                let size = cmp::min(MAX_BUFFER, value.year.len());
-                ptr::copy_nonoverlapping(value.year.as_ptr(), buffer.as_mut_ptr(), size);
-                buffer[size] = 0;
-                ffi::id3tag_set_year(self.ptr(), buffer.as_ptr() as _);
-            }
-
-            if !value.comment.is_empty() {
-                let size = cmp::min(MAX_BUFFER, value.comment.len());
-                ptr::copy_nonoverlapping(value.comment.as_ptr(), buffer.as_mut_ptr(), size);
-                buffer[size] = 0;
-                ffi::id3tag_set_comment(self.ptr(), buffer.as_ptr() as _);
+    #[inline]
+    /// This is where we connect the dots between which tag and which ffi function.
+    fn set_id3_inner(&mut self, id3_value: Id3Value) -> Result<(), Id3TagError> {
+        use Id3Value::*;
+        if !id3_value.as_bytes().is_empty() {
+            unsafe {
+                match id3_value {
+                    Title(_) => ffi::id3tag_set_title(self.ptr(), id3_value.as_buffer_pointer().as_ptr() as _),
+                    Artist(_) => ffi::id3tag_set_artist(self.ptr(), id3_value.as_buffer_pointer().as_ptr() as _),
+                    Track(_) => { ffi::id3tag_set_track(self.ptr(), id3_value.as_buffer_pointer().as_ptr() as _); },
+                    Album(_) => ffi::id3tag_set_album(self.ptr(), id3_value.as_buffer_pointer().as_ptr() as _),
+                    Year(_) => ffi::id3tag_set_year(self.ptr(), id3_value.as_buffer_pointer().as_ptr() as _),
+                    Genre(_) => { ffi::id3tag_set_genre(self.ptr(), id3_value.as_buffer_pointer().as_ptr() as _); },
+                    Comment(_) => ffi::id3tag_set_comment(self.ptr(), id3_value.as_buffer_pointer().as_ptr() as _),
+                    AlbumArt(val) => {
+                        if val.len() > MAX_ALBUM_ART_SIZE {
+                            return Err(Id3TagError::AlbumArtOverflow);
+                        }
+                        ffi::id3tag_set_albumart(self.ptr(), val.as_ptr() as _, val.len());
+                    },
+                };
             }
         }
 
